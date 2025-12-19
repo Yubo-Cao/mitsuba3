@@ -45,8 +45,8 @@ Distant radiancemeter sensor (:monosp:`distant`)
 
  * - srf
    - |spectrum|
-   - Sensor Response Function that defines the :ref:`spectral sensitivity <explanation_srf_sensor>`
-     of the sensor (Default: :monosp:`none`)
+   - Sensor Response Function that defines the :ref:`spectral sensitivity
+<explanation_srf_sensor>` of the sensor (Default: :monosp:`none`)
 
 This sensor plugin implements a distant directional sensor which records
 radiation leaving the scene in a given direction. It records the spectral
@@ -102,7 +102,6 @@ public:
     // instantiated.
     ScalarBoundingBox3f bbox() const override { return ScalarBoundingBox3f(); }
 
-
     template <RayTargetType TargetType>
     using Impl = DistantSensorImpl<Float, Spectrum, TargetType>;
 
@@ -145,8 +144,7 @@ public:
             Throw("This sensor only supports films of size 1x1 Pixels!");
 
         // Check reconstruction filter radius
-        if (m_film->rfilter()->radius() >
-            0.5f + math::RayEpsilon<Float>) {
+        if (m_film->rfilter()->radius() > 0.5f + math::RayEpsilon<Float>) {
             Log(Warn, "This sensor should be used with a reconstruction filter "
                       "with a radius of 0.5 or lower (e.g. default box)");
         }
@@ -158,13 +156,15 @@ public:
                       "can be specified at the same time!'");
             }
 
-            ScalarVector3f direction(normalize(props.get<ScalarVector3f>("direction")));
+            ScalarVector3f direction(
+                normalize(props.get<ScalarVector3f>("direction")));
             ScalarVector3f up;
 
             std::tie(std::ignore, up) = coordinate_system(direction);
 
             m_to_world = ScalarAffineTransform4f::look_at(
                 ScalarPoint3f(0.0f), ScalarPoint3f(direction), up);
+            dr::make_opaque(m_to_world);
         }
 
         // Set ray target if relevant
@@ -186,23 +186,21 @@ public:
         m_bsphere = scene->bbox().bounding_sphere();
         m_bsphere.radius =
             dr::maximum(math::RayEpsilon<Float>,
-                    m_bsphere.radius * (1.f + math::RayEpsilon<Float>) );
+                        m_bsphere.radius * (1.f + math::RayEpsilon<Float>) );
     }
 
-    std::pair<Ray3f, Spectrum>
-    sample_ray(Float time, Float wavelength_sample,
-                    const Point2f & /*film_sample*/,
-                    const Point2f &aperture_sample, Mask active) const override {
+    std::pair<Ray3f, Spectrum> sample_ray(Float time, Float wavelength_sample,
+                                          const Point2f & /*film_sample*/,
+                                          const Point2f &aperture_sample,
+                                          Mask active) const override {
         MI_MASK_ARGUMENT(active);
 
         Ray3f ray;
         ray.time = time;
 
         // Sample spectrum
-        auto [wavelengths, wav_weight] =
-            sample_wavelengths(dr::zeros<SurfaceInteraction3f>(),
-                               wavelength_sample,
-                               active);
+        auto [wavelengths, wav_weight] = sample_wavelengths(
+            dr::zeros<SurfaceInteraction3f>(), wavelength_sample, active);
         ray.wavelengths = wavelengths;
 
         // Sample ray origin
@@ -213,13 +211,13 @@ public:
 
         // Sample target point and position ray origin
         if constexpr (TargetType == RayTargetType::Point) {
-            ray.o = m_target_point - 2.f * ray.d * m_bsphere.radius;
+            ray.o      = m_target_point - 2.f * ray.d * m_bsphere.radius;
             ray_weight = wav_weight;
         } else if constexpr (TargetType == RayTargetType::Shape) {
             // Use area-based sampling of shape
             PositionSample3f ps =
                 m_target_shape->sample_position(time, aperture_sample, active);
-            ray.o = ps.p - 2.f * ray.d * m_bsphere.radius;
+            ray.o      = ps.p - 2.f * ray.d * m_bsphere.radius;
             ray_weight = wav_weight / (ps.pdf * m_target_shape->surface_area());
         } else { // if constexpr (TargetType == RayTargetType::None) {
             // Sample target uniformly on bounding sphere cross section
@@ -227,7 +225,8 @@ public:
                 warp::square_to_uniform_disk_concentric(aperture_sample);
             Vector3f perp_offset =
                 m_to_world.value() * Vector3f(offset.x(), offset.y(), 0.f);
-            ray.o = m_bsphere.center + perp_offset * m_bsphere.radius - ray.d * m_bsphere.radius;
+            ray.o = m_bsphere.center + perp_offset * m_bsphere.radius -
+                    ray.d * m_bsphere.radius;
             ray_weight = wav_weight;
         }
 
@@ -295,6 +294,5 @@ constexpr const char *distant_sensor_class_name() {
     }
 }
 NAMESPACE_END(detail)
-
 
 NAMESPACE_END(mitsuba)
