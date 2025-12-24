@@ -8,5 +8,6 @@ add_plugin(irradiancemeter irradiancemeter.cpp)
 add_plugin(distant         distant.cpp)
 add_plugin(batch           batch.cpp)
 add_plugin(distantmeow     distantmeow.cpp)
+add_plugin(distantkitten   distantkitten.cpp)
 
 set(MI_PLUGIN_TARGETS "${MI_PLUGIN_TARGETS}" PARENT_SCOPE)

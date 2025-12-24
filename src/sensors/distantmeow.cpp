@@ -202,23 +202,16 @@ public:
         ray.wavelengths = wavelengths;
 
         // Convert film sample to angular direction
-        // film_sample is in [0, 1]^2, map to angular bins
-        // Add 0.5 offset so we sample bin centers when film_sample = 0.5
         Float phi = m_phi_min + film_sample.x() * (m_phi_max - m_phi_min);
         Float theta =
             m_theta_min + film_sample.y() * (m_theta_max - m_theta_min);
 
-        // Compute direction vector (spherical to Cartesian)
-        // θ=0 is +z, θ=π is -z
         Float sin_theta = dr::sin(theta);
         Float cos_theta = dr::cos(theta);
         Float sin_phi   = dr::sin(phi);
         Float cos_phi   = dr::cos(phi);
 
-        // Direction we're measuring (outgoing from scene)
         Vector3f omega(sin_theta * cos_phi, sin_theta * sin_phi, cos_theta);
-
-        // Ray shoots in opposite direction (into scene)
         ray.d = -omega;
 
         // Sample target and position ray origin
@@ -273,7 +266,7 @@ public:
 
     std::string to_string() const override {
         std::ostringstream oss;
-        oss << "DistantAngular[" << std::endl
+        oss << "DistantMeow[" << std::endl
             << "  phi_bins = " << m_phi_bins << "," << std::endl
             << "  theta_bins = " << m_theta_bins << "," << std::endl
             << "  phi = [" << m_phi_min << ", " << m_phi_max << "],"
