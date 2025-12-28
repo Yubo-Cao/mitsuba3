@@ -11,6 +11,10 @@
  *   - theta: polar angle from +z axis [0, π]
  *   - phi: azimuthal angle from +x axis [0, 2π)
  *   - omega = (sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta))
+ *
+ * Parameters are stored as Dr.Jit arrays and made opaque to prevent kernel
+ * recompilation when values change. Uses dr::while_loop for dynamic iteration
+ * so that even changing the number of bases doesn't require recompilation.
  */
 
 #include <mitsuba/core/bsphere.h>
@@ -20,6 +24,7 @@
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/scene.h>
 #include <mitsuba/render/texture.h>
+#include <drjit/while_loop.h>
 #include <sstream>
 
 NAMESPACE_BEGIN(mitsuba)
@@ -61,6 +66,9 @@ the radiance varies by direction according to a sum of analytical basis function
 Unlike bitmap-based emitters, this evaluates the basis functions continuously,
 avoiding rasterization artifacts and reducing memory usage.
 
+All basis function parameters are stored as Dr.Jit arrays and can be updated
+at runtime via mi.traverse() without triggering kernel recompilation.
+
 */
 
 // Helper function to parse comma-separated floats
@@ -81,6 +89,8 @@ public:
     MI_IMPORT_TYPES(Scene, Texture)
 
     using Warp = Hierarchical2D<Float, 0>;
+    using FloatStorage = DynamicBuffer<Float>;
+    using UInt32Storage = DynamicBuffer<UInt32>;
 
     SphericalBasisEmitter(const Properties &props) : Base(props) {
         // Initialize bounding sphere (updated in set_scene)
@@ -93,6 +103,12 @@ public:
         m_clamp_min = props.get<ScalarFloat>("clamp_min", 0.f);
         m_clamp_max = props.get<ScalarFloat>("clamp_max", std::numeric_limits<ScalarFloat>::infinity());
 
+        // Temporary vectors for parsing
+        std::vector<ScalarFloat> gauss_mu_x, gauss_mu_y, gauss_mu_z;
+        std::vector<ScalarFloat> gauss_sigma, gauss_intensity;
+        std::vector<ScalarFloat> heavi_theta_min, heavi_theta_max;
+        std::vector<ScalarFloat> heavi_phi_min, heavi_phi_max, heavi_intensity;
+
         // Parse Gaussian bases from string: "mu_x,mu_y,mu_z,sigma,intensity;..."
         std::string gaussian_str = props.get<std::string>("gaussian_params", "");
         if (!gaussian_str.empty()) {
@@ -104,14 +120,14 @@ public:
                 if (vals.size() != 5) {
                     Throw("Each Gaussian basis must have 5 values: mu_x,mu_y,mu_z,sigma,intensity");
                 }
-                m_gaussian_mu_x.push_back((ScalarFloat)vals[0]);
-                m_gaussian_mu_y.push_back((ScalarFloat)vals[1]);
-                m_gaussian_mu_z.push_back((ScalarFloat)vals[2]);
-                m_gaussian_sigma.push_back((ScalarFloat)vals[3]);
-                m_gaussian_intensity.push_back((ScalarFloat)vals[4]);
+                gauss_mu_x.push_back((ScalarFloat)vals[0]);
+                gauss_mu_y.push_back((ScalarFloat)vals[1]);
+                gauss_mu_z.push_back((ScalarFloat)vals[2]);
+                gauss_sigma.push_back((ScalarFloat)vals[3]);
+                gauss_intensity.push_back((ScalarFloat)vals[4]);
             }
         }
-        m_n_gaussian = (int)m_gaussian_mu_x.size();
+        m_n_gaussian_scalar = (uint32_t)gauss_mu_x.size();
 
         // Parse Heaviside bases from string: "theta_min,theta_max,phi_min,phi_max,intensity;..."
         std::string heaviside_str = props.get<std::string>("heaviside_params", "");
@@ -124,17 +140,21 @@ public:
                 if (vals.size() != 5) {
                     Throw("Each Heaviside basis must have 5 values: theta_min,theta_max,phi_min,phi_max,intensity");
                 }
-                m_heaviside_theta_min.push_back((ScalarFloat)vals[0]);
-                m_heaviside_theta_max.push_back((ScalarFloat)vals[1]);
-                m_heaviside_phi_min.push_back((ScalarFloat)vals[2]);
-                m_heaviside_phi_max.push_back((ScalarFloat)vals[3]);
-                m_heaviside_intensity.push_back((ScalarFloat)vals[4]);
+                heavi_theta_min.push_back((ScalarFloat)vals[0]);
+                heavi_theta_max.push_back((ScalarFloat)vals[1]);
+                heavi_phi_min.push_back((ScalarFloat)vals[2]);
+                heavi_phi_max.push_back((ScalarFloat)vals[3]);
+                heavi_intensity.push_back((ScalarFloat)vals[4]);
             }
         }
-        m_n_heaviside = (int)m_heaviside_theta_min.size();
+        m_n_heaviside_scalar = (uint32_t)heavi_theta_min.size();
 
-        if (m_n_gaussian == 0 && m_n_heaviside == 0)
+        if (m_n_gaussian_scalar == 0 && m_n_heaviside_scalar == 0)
             Log(Warn, "SphericalBasisEmitter: No basis functions specified!");
+
+        // Convert to Dr.Jit arrays for opaque parameter updates
+        init_drjit_arrays(gauss_mu_x, gauss_mu_y, gauss_mu_z, gauss_sigma, gauss_intensity,
+                          heavi_theta_min, heavi_theta_max, heavi_phi_min, heavi_phi_max, heavi_intensity);
 
         // Build importance sampling distribution
         build_distribution();
@@ -142,14 +162,127 @@ public:
         m_needs_sample_3 = false;
         m_flags = EmitterFlags::Infinite | EmitterFlags::SpatiallyVarying;
 
-        Log(Info, "SphericalBasisEmitter: %d Gaussian + %d Heaviside bases, "
+        Log(Info, "SphericalBasisEmitter: %u Gaussian + %u Heaviside bases, "
                   "sampling_res=%d, clamp=[%f, %f]",
-            m_n_gaussian, m_n_heaviside, m_sampling_res, m_clamp_min, m_clamp_max);
+            m_n_gaussian_scalar, m_n_heaviside_scalar, m_sampling_res, m_clamp_min, m_clamp_max);
+    }
+
+    void init_drjit_arrays(
+        const std::vector<ScalarFloat> &gauss_mu_x,
+        const std::vector<ScalarFloat> &gauss_mu_y,
+        const std::vector<ScalarFloat> &gauss_mu_z,
+        const std::vector<ScalarFloat> &gauss_sigma,
+        const std::vector<ScalarFloat> &gauss_intensity,
+        const std::vector<ScalarFloat> &heavi_theta_min,
+        const std::vector<ScalarFloat> &heavi_theta_max,
+        const std::vector<ScalarFloat> &heavi_phi_min,
+        const std::vector<ScalarFloat> &heavi_phi_max,
+        const std::vector<ScalarFloat> &heavi_intensity
+    ) {
+        // Store counts as opaque Dr.Jit values to prevent recompilation
+        m_n_gaussian = UInt32(m_n_gaussian_scalar);
+        m_n_heaviside = UInt32(m_n_heaviside_scalar);
+        dr::make_opaque(m_n_gaussian, m_n_heaviside);
+
+        // Initialize Gaussian parameter arrays
+        if (m_n_gaussian_scalar > 0) {
+            m_gaussian_mu_x = dr::load<FloatStorage>(gauss_mu_x.data(), m_n_gaussian_scalar);
+            m_gaussian_mu_y = dr::load<FloatStorage>(gauss_mu_y.data(), m_n_gaussian_scalar);
+            m_gaussian_mu_z = dr::load<FloatStorage>(gauss_mu_z.data(), m_n_gaussian_scalar);
+            m_gaussian_sigma = dr::load<FloatStorage>(gauss_sigma.data(), m_n_gaussian_scalar);
+            m_gaussian_intensity = dr::load<FloatStorage>(gauss_intensity.data(), m_n_gaussian_scalar);
+
+            dr::make_opaque(m_gaussian_mu_x, m_gaussian_mu_y, m_gaussian_mu_z,
+                           m_gaussian_sigma, m_gaussian_intensity);
+        } else {
+            // Initialize with dummy single-element arrays for consistent kernel structure
+            m_gaussian_mu_x = dr::zeros<FloatStorage>(1);
+            m_gaussian_mu_y = dr::zeros<FloatStorage>(1);
+            m_gaussian_mu_z = dr::zeros<FloatStorage>(1);
+            m_gaussian_sigma = dr::full<FloatStorage>(1.f, 1);
+            m_gaussian_intensity = dr::zeros<FloatStorage>(1);
+            dr::make_opaque(m_gaussian_mu_x, m_gaussian_mu_y, m_gaussian_mu_z,
+                           m_gaussian_sigma, m_gaussian_intensity);
+        }
+
+        // Initialize Heaviside parameter arrays
+        if (m_n_heaviside_scalar > 0) {
+            m_heaviside_theta_min = dr::load<FloatStorage>(heavi_theta_min.data(), m_n_heaviside_scalar);
+            m_heaviside_theta_max = dr::load<FloatStorage>(heavi_theta_max.data(), m_n_heaviside_scalar);
+            m_heaviside_phi_min = dr::load<FloatStorage>(heavi_phi_min.data(), m_n_heaviside_scalar);
+            m_heaviside_phi_max = dr::load<FloatStorage>(heavi_phi_max.data(), m_n_heaviside_scalar);
+            m_heaviside_intensity = dr::load<FloatStorage>(heavi_intensity.data(), m_n_heaviside_scalar);
+
+            dr::make_opaque(m_heaviside_theta_min, m_heaviside_theta_max,
+                           m_heaviside_phi_min, m_heaviside_phi_max, m_heaviside_intensity);
+        } else {
+            // Initialize with dummy single-element arrays for consistent kernel structure
+            m_heaviside_theta_min = dr::zeros<FloatStorage>(1);
+            m_heaviside_theta_max = dr::zeros<FloatStorage>(1);
+            m_heaviside_phi_min = dr::zeros<FloatStorage>(1);
+            m_heaviside_phi_max = dr::zeros<FloatStorage>(1);
+            m_heaviside_intensity = dr::zeros<FloatStorage>(1);
+            dr::make_opaque(m_heaviside_theta_min, m_heaviside_theta_max,
+                           m_heaviside_phi_min, m_heaviside_phi_max, m_heaviside_intensity);
+        }
     }
 
     void traverse(TraversalCallback *cb) override {
         Base::traverse(cb);
-        cb->put("to_world", m_to_world, ParamFlags::NonDifferentiable);
+        cb->put("to_world", *m_to_world.ptr(), ParamFlags::NonDifferentiable);
+
+        // Expose basis counts for runtime updates
+        cb->put("n_gaussian", m_n_gaussian, ParamFlags::NonDifferentiable);
+        cb->put("n_heaviside", m_n_heaviside, ParamFlags::NonDifferentiable);
+
+        // Expose Gaussian parameters for runtime updates
+        cb->put("gaussian_mu_x", m_gaussian_mu_x, ParamFlags::NonDifferentiable);
+        cb->put("gaussian_mu_y", m_gaussian_mu_y, ParamFlags::NonDifferentiable);
+        cb->put("gaussian_mu_z", m_gaussian_mu_z, ParamFlags::NonDifferentiable);
+        cb->put("gaussian_sigma", m_gaussian_sigma, ParamFlags::NonDifferentiable);
+        cb->put("gaussian_intensity", m_gaussian_intensity, ParamFlags::NonDifferentiable);
+
+        // Expose Heaviside parameters for runtime updates
+        cb->put("heaviside_theta_min", m_heaviside_theta_min, ParamFlags::NonDifferentiable);
+        cb->put("heaviside_theta_max", m_heaviside_theta_max, ParamFlags::NonDifferentiable);
+        cb->put("heaviside_phi_min", m_heaviside_phi_min, ParamFlags::NonDifferentiable);
+        cb->put("heaviside_phi_max", m_heaviside_phi_max, ParamFlags::NonDifferentiable);
+        cb->put("heaviside_intensity", m_heaviside_intensity, ParamFlags::NonDifferentiable);
+
+        // Expose clamp parameters
+        cb->put("clamp_min", m_clamp_min, ParamFlags::NonDifferentiable);
+        cb->put("clamp_max", m_clamp_max, ParamFlags::NonDifferentiable);
+    }
+
+    void parameters_changed(const std::vector<std::string> &keys) override {
+        // Update scalar counts from Dr.Jit values
+        if (dr::width(m_n_gaussian) > 0)
+            m_n_gaussian_scalar = dr::slice(m_n_gaussian, 0);
+        if (dr::width(m_n_heaviside) > 0)
+            m_n_heaviside_scalar = dr::slice(m_n_heaviside, 0);
+
+        // Make parameters opaque after updates
+        dr::make_opaque(m_n_gaussian, m_n_heaviside);
+        dr::make_opaque(m_gaussian_mu_x, m_gaussian_mu_y, m_gaussian_mu_z,
+                       m_gaussian_sigma, m_gaussian_intensity);
+        dr::make_opaque(m_heaviside_theta_min, m_heaviside_theta_max,
+                       m_heaviside_phi_min, m_heaviside_phi_max, m_heaviside_intensity);
+
+        // Rebuild importance sampling distribution if parameters changed
+        bool rebuild_dist = keys.empty();
+        for (const auto &key : keys) {
+            if (key.find("gaussian") != std::string::npos ||
+                key.find("heaviside") != std::string::npos ||
+                key.find("clamp") != std::string::npos ||
+                key.find("n_") != std::string::npos) {
+                rebuild_dist = true;
+                break;
+            }
+        }
+
+        if (rebuild_dist) {
+            build_distribution();
+        }
     }
 
     void set_scene(const Scene *scene) override {
@@ -165,48 +298,87 @@ public:
     }
 
     /// Evaluate the sum of all basis functions at a given direction (in local frame)
+    /// Uses dr::while_loop for dynamic iteration to avoid kernel recompilation
     Float eval_bases(const Vector3f &omega, Mask active) const {
         Float result = 0.f;
 
-        // Evaluate Gaussian bases: f(omega) = intensity * exp(-0.5 * (angle/sigma)^2)
-        for (int i = 0; i < m_n_gaussian; ++i) {
-            Vector3f mu(m_gaussian_mu_x[i], m_gaussian_mu_y[i], m_gaussian_mu_z[i]);
-            Float dot_val = dr::dot(omega, mu);
-            dot_val = dr::clip(dot_val, -1.f, 1.f);
-            Float angle = dr::acos(dot_val);
-            Float sigma = m_gaussian_sigma[i];
-            Float intensity = m_gaussian_intensity[i];
-            result += intensity * dr::exp(-0.5f * dr::square(angle / sigma));
-        }
-
-        // Evaluate Heaviside bases: f(theta, phi) = intensity if in range, else 0
-        // First compute theta and phi from omega
+        // Precompute theta and phi from omega (needed for Heaviside)
         Float cos_theta = omega.z();
         Float theta = dr::acos(dr::clip(cos_theta, -1.f, 1.f));
         Float phi = dr::atan2(omega.y(), omega.x());
         phi = dr::select(phi < 0.f, phi + 2.f * dr::Pi<Float>, phi);
 
-        for (int i = 0; i < m_n_heaviside; ++i) {
-            Float theta_min = m_heaviside_theta_min[i];
-            Float theta_max = m_heaviside_theta_max[i];
-            Float phi_min = m_heaviside_phi_min[i];
-            Float phi_max = m_heaviside_phi_max[i];
-            Float intensity = m_heaviside_intensity[i];
+        // Evaluate Gaussian bases using dynamic while_loop
+        {
+            UInt32 i_init = dr::zeros<UInt32>(dr::width(active));
+            Float sum_init = dr::zeros<Float>(dr::width(active));
 
-            Mask in_theta = (theta >= theta_min) & (theta < theta_max);
-            Mask in_phi = (phi >= phi_min) & (phi < phi_max);
-            result += dr::select(in_theta & in_phi & active, intensity, 0.f);
+            // Capture needed values for the loop
+            auto [i_final, gauss_sum] = dr::while_loop(
+                std::make_tuple(i_init, sum_init),
+                // Condition: continue while i < n_gaussian
+                [&](const UInt32 &i, const Float &) {
+                    return active && (i < m_n_gaussian);
+                },
+                // Body: accumulate Gaussian contributions
+                [&](UInt32 &i, Float &sum) {
+                    Float mu_x = dr::gather<Float>(m_gaussian_mu_x, i, active);
+                    Float mu_y = dr::gather<Float>(m_gaussian_mu_y, i, active);
+                    Float mu_z = dr::gather<Float>(m_gaussian_mu_z, i, active);
+                    Float sigma = dr::gather<Float>(m_gaussian_sigma, i, active);
+                    Float intensity = dr::gather<Float>(m_gaussian_intensity, i, active);
+
+                    Vector3f mu(mu_x, mu_y, mu_z);
+                    Float dot_val = dr::dot(omega, mu);
+                    dot_val = dr::clip(dot_val, -1.f, 1.f);
+                    Float angle = dr::acos(dot_val);
+                    sum += intensity * dr::exp(-0.5f * dr::square(angle / sigma));
+
+                    i += 1u;
+                },
+                "Gaussian basis eval"
+            );
+            result += gauss_sum;
+        }
+
+        // Evaluate Heaviside bases using dynamic while_loop
+        {
+            UInt32 i_init = dr::zeros<UInt32>(dr::width(active));
+            Float sum_init = dr::zeros<Float>(dr::width(active));
+
+            auto [i_final, heavi_sum] = dr::while_loop(
+                std::make_tuple(i_init, sum_init),
+                // Condition
+                [&](const UInt32 &i, const Float &) {
+                    return active && (i < m_n_heaviside);
+                },
+                // Body
+                [&](UInt32 &i, Float &sum) {
+                    Float theta_min = dr::gather<Float>(m_heaviside_theta_min, i, active);
+                    Float theta_max = dr::gather<Float>(m_heaviside_theta_max, i, active);
+                    Float phi_min = dr::gather<Float>(m_heaviside_phi_min, i, active);
+                    Float phi_max = dr::gather<Float>(m_heaviside_phi_max, i, active);
+                    Float intensity = dr::gather<Float>(m_heaviside_intensity, i, active);
+
+                    Mask in_theta = (theta >= theta_min) & (theta < theta_max);
+                    Mask in_phi = (phi >= phi_min) & (phi < phi_max);
+                    sum += dr::select(in_theta & in_phi, intensity, 0.f);
+
+                    i += 1u;
+                },
+                "Heaviside basis eval"
+            );
+            result += heavi_sum;
         }
 
         // Apply clamping
-        result = dr::clip(result, m_clamp_min, m_clamp_max);
+        result = dr::clip(result, Float(m_clamp_min), Float(m_clamp_max));
 
         return result;
     }
 
     /// Convert UV coordinates [0,1]² to direction vector
     Vector3f uv_to_direction(const Point2f &uv) const {
-        // uv.x -> phi [0, 2π), uv.y -> theta [0, π]
         Float phi = uv.x() * 2.f * dr::Pi<Float>;
         Float theta = uv.y() * dr::Pi<Float>;
 
@@ -229,11 +401,7 @@ public:
     Spectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
 
-        // Get direction in local frame
-        // For infinite emitters, si.wi is the ray direction; we evaluate at this direction
-        // to match the distantmeow sensor's coordinate convention
         Vector3f d = m_to_world.value().inverse() * si.wi;
-
         Float radiance = eval_bases(d, active);
 
         return depolarizer<Spectrum>(radiance) & active;
@@ -245,36 +413,27 @@ public:
                                           Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
 
-        // 1. Sample spatial component (disk perpendicular to direction)
         Point2f offset = warp::square_to_uniform_disk_concentric(spatial_sample);
 
-        // 2. Sample directional component using importance sampling
         auto [uv, pdf] = m_warp.sample(dir_sample, nullptr, active);
         active &= pdf > 0.f;
 
-        // Convert UV to direction (in local frame)
         Vector3f d_local = uv_to_direction(uv);
 
-        // Account for sin(theta) in spherical measure
-        // Use safe_rsqrt pattern from envmap.cpp
         Float sin_theta_sq = dr::maximum(1.f - dr::square(d_local.z()), dr::square(dr::Epsilon<Float>));
         Float inv_sin_theta = dr::rsqrt(sin_theta_sq);
         pdf *= inv_sin_theta * dr::InvTwoPi<Float> * dr::InvPi<Float>;
 
-        // Transform to world frame (negate for ray direction into scene)
         Vector3f d_global = m_to_world.value() * (-d_local);
 
-        // Compute ray origin (behind the scene, shooting toward center)
         Vector3f perp_offset = Frame3f(-d_global).to_world(Vector3f(offset.x(), offset.y(), 0.f));
         Point3f origin = m_bsphere.center + (perp_offset - d_global) * m_bsphere.radius;
 
-        // 3. Sample wavelengths
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
         si.time = time;
         si.p = origin;
         auto [wavelengths, wav_weight] = sample_wavelengths(si, wavelength_sample, active);
 
-        // Compute weight
         Float radiance = eval_bases(d_local, active);
         Float r2 = dr::square(m_bsphere.radius);
         Spectrum weight = wav_weight * radiance * dr::Pi<Float> * r2 / pdf;
@@ -289,22 +448,17 @@ public:
                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleDirection, active);
 
-        // Sample direction using importance sampling
         auto [uv, pdf] = m_warp.sample(sample, nullptr, active);
         active &= pdf > 0.f;
 
-        // Convert UV to direction in local frame
         Vector3f d_local = uv_to_direction(uv);
 
-        // Account for sin(theta) in solid angle measure
         Float sin_theta_sq = dr::maximum(1.f - dr::square(d_local.z()), dr::square(dr::Epsilon<Float>));
         Float inv_sin_theta = dr::rsqrt(sin_theta_sq);
         pdf *= inv_sin_theta * dr::InvTwoPi<Float> * dr::InvPi<Float>;
 
-        // Transform to world frame
         Vector3f d = m_to_world.value() * d_local;
 
-        // Compute distance (2 * radius ensures we're outside the scene)
         Float radius = dr::maximum(m_bsphere.radius, dr::norm(it.p - m_bsphere.center));
         Float dist = 2.f * radius;
 
@@ -319,7 +473,6 @@ public:
         ds.d = d;
         ds.dist = dist;
 
-        // Evaluate radiance at this direction
         Float radiance = eval_bases(d_local, active);
         Spectrum weight = depolarizer<Spectrum>(radiance) / ds.pdf;
 
@@ -328,13 +481,9 @@ public:
 
     Float pdf_direction(const Interaction3f & /*it*/, const DirectionSample3f &ds,
                         Mask /*active*/) const override {
-        // Get direction in local frame
         Vector3f d = m_to_world.value().inverse() * ds.d;
-
-        // Convert to UV
         Point2f uv = direction_to_uv(d);
 
-        // Get PDF from warp
         Float sin_theta_sq = dr::maximum(1.f - dr::square(d.z()), dr::square(dr::Epsilon<Float>));
         Float inv_sin_theta = dr::rsqrt(sin_theta_sq);
 
@@ -346,9 +495,7 @@ public:
                             Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
 
-        // Get direction in local frame
         Vector3f d = m_to_world.value().inverse() * ds.d;
-
         Float radiance = eval_bases(d, active);
 
         return depolarizer<Spectrum>(radiance) & active;
@@ -372,15 +519,14 @@ public:
     }
 
     ScalarBoundingBox3f bbox() const override {
-        // Infinite emitter has no finite bounding box
         return ScalarBoundingBox3f();
     }
 
     std::string to_string() const override {
         std::ostringstream oss;
         oss << "SphericalBasisEmitter[" << std::endl
-            << "  n_gaussian = " << m_n_gaussian << "," << std::endl
-            << "  n_heaviside = " << m_n_heaviside << "," << std::endl
+            << "  n_gaussian = " << m_n_gaussian_scalar << "," << std::endl
+            << "  n_heaviside = " << m_n_heaviside_scalar << "," << std::endl
             << "  sampling_res = " << m_sampling_res << "," << std::endl
             << "  clamp = [" << m_clamp_min << ", " << m_clamp_max << "]," << std::endl
             << "  bsphere = " << string::indent(m_bsphere) << std::endl
@@ -398,6 +544,35 @@ private:
 
         std::unique_ptr<ScalarFloat[]> weights(new ScalarFloat[total]);
 
+        // Extract scalar values from Dr.Jit arrays for distribution building
+        std::vector<ScalarFloat> gauss_mu_x_s(m_n_gaussian_scalar);
+        std::vector<ScalarFloat> gauss_mu_y_s(m_n_gaussian_scalar);
+        std::vector<ScalarFloat> gauss_mu_z_s(m_n_gaussian_scalar);
+        std::vector<ScalarFloat> gauss_sigma_s(m_n_gaussian_scalar);
+        std::vector<ScalarFloat> gauss_intensity_s(m_n_gaussian_scalar);
+
+        std::vector<ScalarFloat> heavi_theta_min_s(m_n_heaviside_scalar);
+        std::vector<ScalarFloat> heavi_theta_max_s(m_n_heaviside_scalar);
+        std::vector<ScalarFloat> heavi_phi_min_s(m_n_heaviside_scalar);
+        std::vector<ScalarFloat> heavi_phi_max_s(m_n_heaviside_scalar);
+        std::vector<ScalarFloat> heavi_intensity_s(m_n_heaviside_scalar);
+
+        if (m_n_gaussian_scalar > 0) {
+            dr::store(gauss_mu_x_s.data(), m_gaussian_mu_x);
+            dr::store(gauss_mu_y_s.data(), m_gaussian_mu_y);
+            dr::store(gauss_mu_z_s.data(), m_gaussian_mu_z);
+            dr::store(gauss_sigma_s.data(), m_gaussian_sigma);
+            dr::store(gauss_intensity_s.data(), m_gaussian_intensity);
+        }
+
+        if (m_n_heaviside_scalar > 0) {
+            dr::store(heavi_theta_min_s.data(), m_heaviside_theta_min);
+            dr::store(heavi_theta_max_s.data(), m_heaviside_theta_max);
+            dr::store(heavi_phi_min_s.data(), m_heaviside_phi_min);
+            dr::store(heavi_phi_max_s.data(), m_heaviside_phi_max);
+            dr::store(heavi_intensity_s.data(), m_heaviside_intensity);
+        }
+
         ScalarFloat theta_scale = ScalarFloat(dr::Pi<double> / res);
         ScalarFloat phi_scale = ScalarFloat(2.0 * dr::Pi<double> / res);
 
@@ -411,68 +586,65 @@ private:
                 ScalarFloat sin_phi = std::sin(phi);
                 ScalarFloat cos_phi = std::cos(phi);
 
-                // Direction vector
                 ScalarVector3f omega(sin_theta * cos_phi, sin_theta * sin_phi, cos_theta);
 
-                // Evaluate bases at this direction
                 ScalarFloat val = 0.f;
 
                 // Gaussian bases
-                for (int i = 0; i < m_n_gaussian; ++i) {
-                    ScalarVector3f mu(m_gaussian_mu_x[i], m_gaussian_mu_y[i], m_gaussian_mu_z[i]);
+                for (uint32_t i = 0; i < m_n_gaussian_scalar; ++i) {
+                    ScalarVector3f mu(gauss_mu_x_s[i], gauss_mu_y_s[i], gauss_mu_z_s[i]);
                     ScalarFloat dot_val = dr::dot(omega, mu);
                     dot_val = std::max(ScalarFloat(-1), std::min(ScalarFloat(1), dot_val));
                     ScalarFloat angle = std::acos(dot_val);
-                    ScalarFloat sigma = m_gaussian_sigma[i];
-                    ScalarFloat intensity = m_gaussian_intensity[i];
+                    ScalarFloat sigma = gauss_sigma_s[i];
+                    ScalarFloat intensity = gauss_intensity_s[i];
                     val += intensity * std::exp(-0.5f * (angle / sigma) * (angle / sigma));
                 }
 
                 // Heaviside bases
-                for (int i = 0; i < m_n_heaviside; ++i) {
-                    bool in_theta = (theta >= m_heaviside_theta_min[i]) &&
-                                    (theta < m_heaviside_theta_max[i]);
-                    bool in_phi = (phi >= m_heaviside_phi_min[i]) &&
-                                  (phi < m_heaviside_phi_max[i]);
+                for (uint32_t i = 0; i < m_n_heaviside_scalar; ++i) {
+                    bool in_theta = (theta >= heavi_theta_min_s[i]) &&
+                                    (theta < heavi_theta_max_s[i]);
+                    bool in_phi = (phi >= heavi_phi_min_s[i]) &&
+                                  (phi < heavi_phi_max_s[i]);
                     if (in_theta && in_phi)
-                        val += m_heaviside_intensity[i];
+                        val += heavi_intensity_s[i];
                 }
 
-                // Apply clamping
                 val = std::max(m_clamp_min, std::min(m_clamp_max, val));
-
-                // Weight by sin(theta) for proper spherical measure
                 weights[y * res + x] = val * sin_theta;
             }
         }
 
-        // Create hierarchical warp for importance sampling
         m_warp = Warp(weights.get(), ScalarVector2u((uint32_t)res, (uint32_t)res));
 
         Log(Info, "SphericalBasisEmitter: Built importance sampling distribution (%zux%zu)", res, res);
     }
 
-    // Bounding sphere for the scene
     ScalarBoundingSphere3f m_bsphere;
 
-    // Importance sampling
     int m_sampling_res;
     Warp m_warp;
 
-    // Clamping
     ScalarFloat m_clamp_min, m_clamp_max;
 
-    // Gaussian basis parameters
-    int m_n_gaussian;
-    std::vector<ScalarFloat> m_gaussian_mu_x, m_gaussian_mu_y, m_gaussian_mu_z;
-    std::vector<ScalarFloat> m_gaussian_sigma;
-    std::vector<ScalarFloat> m_gaussian_intensity;
+    // Scalar counts for CPU-side operations (distribution building, etc.)
+    uint32_t m_n_gaussian_scalar;
+    uint32_t m_n_heaviside_scalar;
 
-    // Heaviside basis parameters
-    int m_n_heaviside;
-    std::vector<ScalarFloat> m_heaviside_theta_min, m_heaviside_theta_max;
-    std::vector<ScalarFloat> m_heaviside_phi_min, m_heaviside_phi_max;
-    std::vector<ScalarFloat> m_heaviside_intensity;
+    // Dr.Jit counts for opaque loop bounds (prevents kernel recompilation)
+    UInt32 m_n_gaussian;
+    UInt32 m_n_heaviside;
+
+    // Gaussian basis parameters - stored as Dr.Jit arrays for opaque access
+    FloatStorage m_gaussian_mu_x, m_gaussian_mu_y, m_gaussian_mu_z;
+    FloatStorage m_gaussian_sigma;
+    FloatStorage m_gaussian_intensity;
+
+    // Heaviside basis parameters - stored as Dr.Jit arrays for opaque access
+    FloatStorage m_heaviside_theta_min, m_heaviside_theta_max;
+    FloatStorage m_heaviside_phi_min, m_heaviside_phi_max;
+    FloatStorage m_heaviside_intensity;
 };
 
 MI_EXPORT_PLUGIN(SphericalBasisEmitter)
