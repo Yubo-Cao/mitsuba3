@@ -19,10 +19,10 @@ public:
     DistantAngularSensor(const Properties &props) : Base(props) {
         // Get target point (default to origin)
         m_target_point = props.get<ScalarPoint3f>("target", ScalarPoint3f(0.f, 0.f, 0.f));
-        
+
         // Store film resolution for angular mapping
         m_film_size = m_film->size();
-        
+
         // Check reconstruction filter radius
         if (m_film->rfilter()->radius() > 0.5f + math::RayEpsilon<Float>) {
             Log(Warn, "This sensor should be used with a reconstruction filter "
@@ -55,30 +55,30 @@ public:
         // bin center = (pixel_index + 0.5) / size
         Float pixel_x = dr::floor(film_sample.x() * Float(m_film_size.x()));
         Float pixel_y = dr::floor(film_sample.y() * Float(m_film_size.y()));
-        
+
         // Clamp to valid range (edge case when film_sample == 1.0)
         pixel_x = dr::minimum(pixel_x, Float(m_film_size.x() - 1));
         pixel_y = dr::minimum(pixel_y, Float(m_film_size.y() - 1));
-        
+
         // Compute bin center in [0, 1]
         Float center_x = (pixel_x + 0.5f) / Float(m_film_size.x());
         Float center_y = (pixel_y + 0.5f) / Float(m_film_size.y());
-        
+
         // Map to angles: x -> phi [0, 2*pi], y -> theta [0, pi]
         Float phi = center_x * (2.f * dr::Pi<Float>);
         Float theta = center_y * dr::Pi<Float>;
-        
+
         // Compute outgoing direction omega = (sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta))
         auto [sin_theta, cos_theta] = dr::sincos(theta);
         auto [sin_phi, cos_phi] = dr::sincos(phi);
-        
-        Vector3f omega(sin_theta * cos_phi, 
-                       sin_theta * sin_phi, 
+
+        Vector3f omega(sin_theta * cos_phi,
+                       sin_theta * sin_phi,
                        cos_theta);
-        
+
         // Ray direction is opposite to outgoing direction (ray travels into scene)
         ray.d = -omega;
-        
+
         // Ray origin: start from behind the target, looking toward it
         // ray.o = target + omega * 2 * radius
         ray.o = m_target_point + omega * (2.f * m_bsphere.radius);

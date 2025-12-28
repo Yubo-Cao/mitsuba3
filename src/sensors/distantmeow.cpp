@@ -8,7 +8,8 @@
  *
  * Film coordinates (x, y) map to:
  *   - x -> phi (azimuthal angle): [0, 2π)
- *   - y -> theta (polar angle): [0, π]
+ *   - y -> cos(theta): uniformly spaced from cos(theta_max) to cos(theta_min)
+ *                      (i.e., -1 to 1 for default full hemisphere)
  *
  * The direction is computed as: ω = (sin(θ)cos(φ), sin(θ)sin(φ), cos(θ))
  * Rays are shot in the -ω direction to measure radiance leaving the scene
@@ -203,11 +204,15 @@ public:
 
         // Convert film sample to angular direction
         Float phi = m_phi_min + film_sample.x() * (m_phi_max - m_phi_min);
-        Float theta =
-            m_theta_min + film_sample.y() * (m_theta_max - m_theta_min);
 
-        Float sin_theta = dr::sin(theta);
-        Float cos_theta = dr::cos(theta);
+        // Linspace from cos(theta_max) to cos(theta_min) in cosine space
+        // (i.e., from -1 to 1 for default full hemisphere), then apply arccos
+        // y=0 maps to cos(theta_max), y=1 maps to cos(theta_min)
+        Float cos_min = dr::cos(m_theta_min);
+        Float cos_max = dr::cos(m_theta_max);
+        Float cos_theta = cos_max + film_sample.y() * (cos_min - cos_max);
+        Float sin_theta = dr::sqrt(1.0f - cos_theta * cos_theta);
+
         Float sin_phi   = dr::sin(phi);
         Float cos_phi   = dr::cos(phi);
 
